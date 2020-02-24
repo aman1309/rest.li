@@ -30,13 +30,11 @@ import java.util.Collections;
 import java.util.Deque;
 import java.util.LinkedList;
 import java.util.List;
-import java.util.Queue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
-import com.linkedin.common.stats.LongStats;
 import com.linkedin.common.stats.LongTracking;
 import com.linkedin.r2.SizeLimitExceededException;
 import org.slf4j.Logger;
@@ -64,10 +62,14 @@ public class AsyncPoolImpl<T> implements AsyncPool<T>
   private final int _maxSize;
   private final int _maxWaiters;
   private final long _idleTimeout;
+  private final long _waiterTimeout;
   private final ScheduledExecutorService _timeoutExecutor;
   private final int _minSize;
   private volatile ScheduledFuture<?> _objectTimeoutFuture;
   private final RateLimiter _rateLimiter;
+
+  public static final int MIN_WAITER_TIMEOUT = 300;
+  public static final int MAX_WAITER_TIMEOUT = 3000;
 
   private enum State { NOT_YET_STARTED, RUNNING, SHUTTING_DOWN, STOPPED }
 
@@ -85,11 +87,12 @@ public class AsyncPoolImpl<T> implements AsyncPool<T>
   private final Deque<TimedObject<T>> _idle = new LinkedList<TimedObject<T>>();
   // When no unused objects are available, callbacks live here while they wait
   // for a new object (either returned by another user, or newly created)
-  private final LinkedDeque<Callback<T>> _waiters = new LinkedDeque<Callback<T>>();
+  private final LinkedDeque<TimeTrackingCallback<T>> _waiters = new LinkedDeque<>();
   private Throwable _lastCreateError = null;
   private State _state = State.NOT_YET_STARTED;
   private Callback<None> _shutdownCallback = null;
   private final AsyncPoolStatsTracker _statsTracker;
+  private final Clock _clock;
 
   /**
    * Constructs an AsyncPool with maxWaiters equals to ({@code Integer.MAX_VALUE}).
@@ -156,6 +159,23 @@ public class AsyncPoolImpl<T> implements AsyncPool<T>
         maxWaiters, strategy, minSize, rateLimiter, SystemClock.instance(), new LongTracking());
   }
 
+  @Deprecated
+  public AsyncPoolImpl(String name,
+      Lifecycle<T> lifecycle,
+      int maxSize,
+      long idleTimeout,
+      ScheduledExecutorService timeoutExecutor,
+      int maxWaiters,
+      Strategy strategy,
+      int minSize,
+      RateLimiter rateLimiter,
+      Clock clock,
+      LongTracker waitTimeTracker)
+  {
+    this(name, lifecycle, maxSize, idleTimeout, Integer.MAX_VALUE, timeoutExecutor, maxWaiters, strategy, minSize,
+        rateLimiter, clock, waitTimeTracker);
+  }
+
   /**
    * Creates an AsyncPoolImpl with a specified strategy of
    * returning pool objects and a minimum pool size.
@@ -192,6 +212,7 @@ public class AsyncPoolImpl<T> implements AsyncPool<T>
       Lifecycle<T> lifecycle,
       int maxSize,
       long idleTimeout,
+      long waiterTimeout,
       ScheduledExecutorService timeoutExecutor,
       int maxWaiters,
       Strategy strategy,
@@ -209,11 +230,13 @@ public class AsyncPoolImpl<T> implements AsyncPool<T>
     _lifecycle = lifecycle;
     _maxSize = maxSize;
     _idleTimeout = idleTimeout;
+    _waiterTimeout = waiterTimeout;
     _timeoutExecutor = timeoutExecutor;
     _maxWaiters = maxWaiters;
     _strategy = strategy;
     _minSize = minSize;
     _rateLimiter = rateLimiter;
+    _clock = clock;
     _statsTracker = new AsyncPoolStatsTracker(
         () -> _lifecycle.getStats(),
         () -> _maxSize,
@@ -255,13 +278,15 @@ public class AsyncPoolImpl<T> implements AsyncPool<T>
         throw new IllegalStateException(_poolName + " is " + _state);
       }
       _state = State.RUNNING;
-      if (_idleTimeout > 0)
+      long timeOut = Math.min(_idleTimeout, _waiterTimeout);
+      if (timeOut > 0)
       {
-        long freq = Math.min(_idleTimeout / 10, 1000);
+        long freq = Math.max(MIN_WAITER_TIMEOUT, Math.min(timeOut / 10, MAX_WAITER_TIMEOUT));
         _objectTimeoutFuture = _timeoutExecutor.scheduleAtFixedRate(new Runnable() {
           @Override
           public void run()
           {
+            timeoutWaiters();
             timeoutObjects();
           }
         }, freq, freq, TimeUnit.MILLISECONDS);
@@ -323,8 +348,8 @@ public class AsyncPoolImpl<T> implements AsyncPool<T>
     // putter needs to add to pool atomically with check for empty wait queue
     boolean create = false;
     boolean reject = false;
-    final LinkedDeque.Node<Callback<T>> node;
-    final Callback<T> callbackWithTracking = new TimeTrackingCallback<T>(callback);
+    final LinkedDeque.Node<TimeTrackingCallback<T>> node;
+    final TimeTrackingCallback<T> callbackWithTracking = new TimeTrackingCallback<T>(callback);
     for (;;)
     {
       TimedObject<T> obj = null;
@@ -601,6 +626,27 @@ public class AsyncPoolImpl<T> implements AsyncPool<T>
       @Override
       public void run(final SimpleCallback callback)
       {
+        boolean shouldIgnore;
+        synchronized (_lock) {
+          // Ignore the object creation if no one is waiting for the object and the pool already has _minSize objects
+          int totalObjects = _checkedOut + _idle.size();
+          shouldIgnore = _waiters.size() == 0 && totalObjects >= _minSize;
+          if (shouldIgnore) {
+            _statsTracker.incrementIgnoredCreation();
+            if (_poolSize >= 1)
+            {
+              // _poolSize also include the count of creation requests pending. So we have to make sure the pool size
+              // count is updated when we ignore the creation request.
+              _poolSize--;
+            }
+          }
+        }
+
+        if (shouldIgnore) {
+          callback.onDone();
+          return;
+        }
+
         _lifecycle.create(new Callback<T>()
         {
           @Override
@@ -668,33 +714,64 @@ public class AsyncPoolImpl<T> implements AsyncPool<T>
 
   private void timeoutObjects()
   {
-    Collection<T> idle = reap(_idle, _idleTimeout);
-    if (idle.size() > 0)
+    Collection<T> expiredObjects = getExpiredObjects();
+    if (expiredObjects.size() > 0)
     {
-      LOG.debug("{}: disposing {} objects due to idle timeout", _poolName, idle.size());
-      for (T obj : idle)
+      LOG.debug("{}: disposing {} objects due to idle timeout", _poolName, expiredObjects.size());
+      for (T obj : expiredObjects)
       {
         destroy(obj, false);
       }
     }
   }
 
-  private <U> Collection<U> reap(Queue<TimedObject<U>> queue, long timeout)
+  private void timeoutWaiters()
   {
-    List<U> toReap = new ArrayList<U>();
-    long now = System.currentTimeMillis();
-    long target = now - timeout;
+    Collection<TimeTrackingCallback<T>> expiredWaiters = getExpiredWaiters();
+    if (expiredWaiters.size() > 0)
+    {
+      LOG.debug("{}: failing {} waiters due to wait timeout", _poolName, expiredWaiters.size());
+      for (TimeTrackingCallback<T> obj : expiredWaiters)
+      {
+        obj.onError(new WaiterTimeoutException("Waiter timeout after " + _waiterTimeout + "ms"));
+      }
+    }
+  }
+
+  private Collection<T> getExpiredObjects()
+  {
+    List<T> expiredObjects = new ArrayList<T>();
+    long now = _clock.currentTimeMillis();
 
     synchronized (_lock)
     {
+      long deadline = now - _idleTimeout;
       int excess = _poolSize - _minSize;
-      for (TimedObject<U> p; (p = queue.peek()) != null && p.getTime() < target && excess > 0; excess--)
+      for (TimedObject<T> p; (p = _idle.peek()) != null && p.getTime() < deadline && excess > 0; excess--)
       {
-        toReap.add(queue.poll().get());
+        expiredObjects.add(_idle.poll().get());
         _statsTracker.incrementTimedOut();
       }
     }
-    return toReap;
+    return expiredObjects;
+  }
+
+  private List<TimeTrackingCallback<T>> getExpiredWaiters()
+  {
+    List<TimeTrackingCallback<T>> expiredWaiters = new ArrayList<>();
+    long now = _clock.currentTimeMillis();
+
+    synchronized (_lock)
+    {
+      long deadline = now - _waiterTimeout;
+      for (TimeTrackingCallback<T> p; (p = _waiters.peek()) != null && p.getTime() < deadline;)
+      {
+        expiredWaiters.add(_waiters.poll());
+        _statsTracker.incrementWaiterTimedOut();
+      }
+    }
+
+    return expiredWaiters;
   }
 
   private void shutdownIfNeeded()
@@ -749,7 +826,7 @@ public class AsyncPoolImpl<T> implements AsyncPool<T>
     shutdown.onSuccess(None.none());
   }
 
-  private static class TimedObject<T>
+  private class TimedObject<T>
   {
     private final T _obj;
     private final long _time;
@@ -757,7 +834,7 @@ public class AsyncPoolImpl<T> implements AsyncPool<T>
     public TimedObject(T obj)
     {
       _obj = obj;
-      _time = System.currentTimeMillis();
+      _time = _clock.currentTimeMillis();
     }
 
     public T get()
@@ -779,13 +856,13 @@ public class AsyncPoolImpl<T> implements AsyncPool<T>
     public TimeTrackingCallback(Callback<T> callback)
     {
       _callback = callback;
-      _startTime = System.currentTimeMillis();
+      _startTime = _clock.currentTimeMillis();
     }
 
     @Override
     public void onError(Throwable e)
     {
-      long waitTime = System.currentTimeMillis() - _startTime;
+      long waitTime = _clock.currentTimeMillis() - _startTime;
       synchronized (_lock)
       {
         _statsTracker.trackWaitTime(waitTime);
@@ -797,13 +874,18 @@ public class AsyncPoolImpl<T> implements AsyncPool<T>
     @Override
     public void onSuccess(T result)
     {
-      long waitTime = System.currentTimeMillis() - _startTime;
+      long waitTime = _clock.currentTimeMillis() - _startTime;
       synchronized (_lock)
       {
         _statsTracker.trackWaitTime(waitTime);
         _statsTracker.sampleMaxWaitTime(waitTime);
       }
       _callback.onSuccess(result);
+    }
+
+    public long getTime()
+    {
+      return _startTime;
     }
   }
 
